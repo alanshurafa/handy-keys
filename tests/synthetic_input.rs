@@ -409,11 +409,12 @@ mod linux {
 #[cfg(target_os = "windows")]
 mod windows_tests {
     use super::*;
+    use handy_keys::{Hotkey, HotkeyManager, HotkeyState, Modifiers};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_MIDDLEUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-        VIRTUAL_KEY, VK_F20, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
-        VK_MEDIA_STOP,
+        VIRTUAL_KEY, VK_F20, VK_LCONTROL, VK_LMENU, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE,
+        VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP,
     };
 
     fn send_f20(key_up: bool) {
@@ -590,5 +591,88 @@ mod windows_tests {
                 vk.0
             );
         }
+    }
+
+    fn send_vk(vk: VIRTUAL_KEY, key_up: bool) -> bool {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if key_up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        // No assert: also called from Drop, where a panic during unwinding
+        // would abort the test binary.
+        sent == 1
+    }
+
+    /// Releases the injected Ctrl+Alt even when an assertion fails, so a
+    /// failing run never leaves modifiers stuck in the session.
+    struct ReleaseCtrlAlt;
+    impl Drop for ReleaseCtrlAlt {
+        fn drop(&mut self) {
+            send_vk(VK_LMENU, true);
+            send_vk(VK_LCONTROL, true);
+        }
+    }
+
+    /// Wait for the next hotkey event with the given state, or time out.
+    fn saw_hotkey_state(manager: &HotkeyManager, state: HotkeyState, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(event) = manager.try_recv() {
+                if event.state == state {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// cjpais/Handy#2398: a mouse click while a blocked modifier-only
+    /// hotkey (Ctrl+Alt) is held must not release it. The hook swallows the
+    /// Alt key-down, so GetAsyncKeyState reports Alt up; the mouse hook's
+    /// reconcile used to read that as a missed release. A lone
+    /// middle-button-up performs no action in the session; the menu mask
+    /// keeps the Alt release from focusing a menu bar.
+    #[test]
+    #[ignore = "needs an interactive desktop session; run: cargo test --test synthetic_input -- --ignored"]
+    fn click_does_not_release_held_modifier_only_hotkey() {
+        let manager = HotkeyManager::new_with_blocking().expect("failed to spawn hotkey manager");
+        manager
+            .register(Hotkey::new(Modifiers::CTRL | Modifiers::OPT, None).unwrap())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let release = ReleaseCtrlAlt;
+        assert!(send_vk(VK_LCONTROL, false), "SendInput failed");
+        assert!(send_vk(VK_LMENU, false), "SendInput failed");
+        assert!(
+            saw_hotkey_state(&manager, HotkeyState::Pressed, Duration::from_secs(2)),
+            "Ctrl+Alt hotkey did not fire"
+        );
+
+        send_mouse_flag(MOUSEEVENTF_MIDDLEUP, 0);
+        assert!(
+            !saw_hotkey_state(&manager, HotkeyState::Released, Duration::from_millis(500)),
+            "mouse click released the held Ctrl+Alt hotkey"
+        );
+
+        drop(release);
+        assert!(
+            saw_hotkey_state(&manager, HotkeyState::Released, Duration::from_secs(2)),
+            "Ctrl+Alt hotkey was not released with the keys"
+        );
     }
 }
