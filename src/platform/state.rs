@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::types::Hotkey;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use crate::types::Key;
 use crate::types::{KeyEvent, Modifiers};
 
@@ -46,6 +46,39 @@ impl ListenerState {
             }
         }
         false
+    }
+}
+
+/// Decide whether to swallow a key-down or key-up of `key`, given whether
+/// the event (with the modifiers seen right now) completes a blocking
+/// hotkey.
+///
+/// A key whose key-down was swallowed stays swallowed (its auto-repeats and
+/// its key-up) until that key-up, even when later events no longer carry the
+/// hotkey's modifiers. Matching each event on its own let the rest of a held
+/// key leak to the focused app with no modifiers as soon as the modifier
+/// flags changed mid-hold (cjpais/Handy#2437). A key-up is swallowed only if
+/// its key-down was, so the focused app never sees an unpaired event.
+///
+/// `swallowed` holds the keys whose key-down was swallowed and that have not
+/// been released yet.
+#[cfg(any(target_os = "macos", test))]
+pub fn swallow_key_event(
+    swallowed: &mut HashSet<Key>,
+    key: Key,
+    is_key_down: bool,
+    completes_hotkey: bool,
+) -> bool {
+    if is_key_down {
+        if swallowed.contains(&key) {
+            return true;
+        }
+        if completes_hotkey {
+            swallowed.insert(key);
+        }
+        completes_hotkey
+    } else {
+        swallowed.remove(&key)
     }
 }
 
@@ -98,6 +131,61 @@ pub fn release_events(tracked: Modifiers, stale: Modifiers) -> Vec<KeyEvent> {
         }
     }
     events
+}
+
+#[cfg(test)]
+mod swallow_tests {
+    use super::*;
+
+    #[test]
+    fn held_hotkey_key_stays_swallowed_after_modifiers_drop() {
+        let mut swallowed = HashSet::new();
+        // Press completes the hotkey: swallowed.
+        assert!(swallow_key_event(&mut swallowed, Key::E, true, true));
+        // Auto-repeats arrive without the modifiers: still swallowed.
+        assert!(swallow_key_event(&mut swallowed, Key::E, true, false));
+        assert!(swallow_key_event(&mut swallowed, Key::E, true, false));
+        // Release without modifiers: swallowed, and the key is forgotten.
+        assert!(swallow_key_event(&mut swallowed, Key::E, false, false));
+        assert!(swallowed.is_empty());
+    }
+
+    #[test]
+    fn unmatched_key_passes_through() {
+        let mut swallowed = HashSet::new();
+        assert!(!swallow_key_event(&mut swallowed, Key::R, true, false));
+        assert!(!swallow_key_event(&mut swallowed, Key::R, true, false));
+        assert!(!swallow_key_event(&mut swallowed, Key::R, false, false));
+        assert!(swallowed.is_empty());
+    }
+
+    #[test]
+    fn release_of_passed_press_is_passed_even_if_it_matches() {
+        // E pressed alone (passed), modifiers added before release: the
+        // release must reach the app too, or the app sees E stuck down.
+        let mut swallowed = HashSet::new();
+        assert!(!swallow_key_event(&mut swallowed, Key::E, true, false));
+        assert!(!swallow_key_event(&mut swallowed, Key::E, false, true));
+    }
+
+    #[test]
+    fn next_press_is_judged_afresh_after_release() {
+        let mut swallowed = HashSet::new();
+        assert!(swallow_key_event(&mut swallowed, Key::E, true, true));
+        assert!(swallow_key_event(&mut swallowed, Key::E, false, true));
+        // A plain E afterwards is typing, not the hotkey.
+        assert!(!swallow_key_event(&mut swallowed, Key::E, true, false));
+        assert!(!swallow_key_event(&mut swallowed, Key::E, false, false));
+    }
+
+    #[test]
+    fn keys_are_tracked_independently() {
+        let mut swallowed = HashSet::new();
+        assert!(swallow_key_event(&mut swallowed, Key::E, true, true));
+        assert!(!swallow_key_event(&mut swallowed, Key::R, true, false));
+        assert!(!swallow_key_event(&mut swallowed, Key::R, false, false));
+        assert!(swallow_key_event(&mut swallowed, Key::E, false, false));
+    }
 }
 
 #[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
