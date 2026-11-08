@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -155,6 +155,13 @@ fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
 struct CallbackCtx {
     state: Arc<Mutex<ListenerState>>,
     tap: Cell<Option<NonNull<CFMachPort>>>,
+    /// The listener's `running` flag. The callback clears it to shut the
+    /// tap thread down when accessibility trust has been revoked.
+    running: Arc<AtomicBool>,
+    /// Trust check run when the system disables the tap. Always
+    /// `check_accessibility` in production; a seam so tests can simulate a
+    /// revoked permission.
+    is_trusted: fn() -> bool,
 }
 
 /// The callback function for the event tap
@@ -180,6 +187,29 @@ unsafe extern "C-unwind" fn event_tap_callback(
         event_type,
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
+        // If the accessibility permission was revoked while we run, the
+        // system keeps disabling the tap. Re-enabling it each time keeps a
+        // filtering tap alive that holds every keyboard and mouse event, and
+        // the whole desktop freezes until the app is force-quit
+        // (cjpais/Handy#1281). Checked only here, when the tap is disabled,
+        // so this adds no polling.
+        if !(ctx.is_trusted)() {
+            eprintln!(
+                "handy-keys: accessibility permission revoked; stopping the event tap \
+                 (create a new listener once the permission is granted again)"
+            );
+            if let Some(tap) = ctx.tap.get() {
+                CGEvent::tap_enable(tap.as_ref(), false);
+            }
+            // Leave the run loop for good. run_event_tap then removes and
+            // invalidates the tap and drops the event sender, so receivers
+            // see the listener as disconnected.
+            ctx.running.store(false, Ordering::SeqCst);
+            if let Some(rl) = CFRunLoop::current() {
+                rl.stop();
+            }
+            return event.as_ptr();
+        }
         if let Some(tap) = ctx.tap.get() {
             CGEvent::tap_enable(tap.as_ref(), true);
         }
@@ -457,6 +487,8 @@ fn run_event_tap(
     let ctx_ptr = Box::into_raw(Box::new(CallbackCtx {
         state: Arc::clone(&state),
         tap: Cell::new(None),
+        running: Arc::clone(&running),
+        is_trusted: check_accessibility,
     }));
 
     let callback: CGEventTapCallBack = Some(event_tap_callback);
@@ -539,11 +571,11 @@ fn run_event_tap(
     // "Cannot grow ipc space beyond IVAC_ENTRIES_MAX" (cjpais/Handy#1827),
     // and even the bare 100ms cycling cost ~10 mach messages/sec. Tap
     // recovery is event-driven in event_tap_callback; shutdown goes through
-    // TapRunLoop::stop. Guarded by `running` in case the loop returns
-    // without a stop request; bail out if the tap's port died (e.g. the
-    // accessibility permission was revoked) so we don't spin on a dead
-    // source.
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
+    // TapRunLoop::stop, or through the callback clearing `running` when the
+    // accessibility permission is revoked. Guarded by `running` in case the
+    // loop returns without a stop request; bail out if the tap's port died
+    // so we don't spin on a dead source.
+    while running.load(Ordering::SeqCst) {
         CFRunLoop::run();
 
         if !CFMachPort::is_valid(&tap) {
@@ -656,12 +688,29 @@ mod tests {
         }
     }
 
-    fn make_ctx(tap: &CFRetained<CFMachPort>) -> CallbackCtx {
+    fn trusted() -> bool {
+        true
+    }
+
+    fn untrusted() -> bool {
+        false
+    }
+
+    fn make_ctx_with(
+        tap: Option<&CFRetained<CFMachPort>>,
+        is_trusted: fn() -> bool,
+    ) -> CallbackCtx {
         let (tx, _rx) = mpsc::channel();
         CallbackCtx {
             state: Arc::new(Mutex::new(ListenerState::new(tx, None))),
-            tap: Cell::new(Some(NonNull::from(&**tap))),
+            tap: Cell::new(tap.map(|t| NonNull::from(&**t))),
+            running: Arc::new(AtomicBool::new(true)),
+            is_trusted,
         }
+    }
+
+    fn make_ctx(tap: &CFRetained<CFMachPort>) -> CallbackCtx {
+        make_ctx_with(Some(tap), trusted)
     }
 
     fn deliver_tap_disabled(ctx: &CallbackCtx, event_type: CGEventType) {
@@ -702,6 +751,52 @@ mod tests {
                 "callback must re-enable the tap after {event_type:?}"
             );
         }
+    }
+
+    /// cjpais/Handy#1281: once accessibility trust is revoked, a tap-disabled
+    /// pseudo-event must shut the listener down instead of re-enabling the
+    /// tap (re-enabling keeps a filtering tap that freezes all input). Needs
+    /// no accessibility permission: no real tap is involved.
+    #[test]
+    fn tap_disabled_without_trust_stops_listener() {
+        for event_type in [
+            CGEventType::TapDisabledByTimeout,
+            CGEventType::TapDisabledByUserInput,
+        ] {
+            let ctx = make_ctx_with(None, untrusted);
+            deliver_tap_disabled(&ctx, event_type);
+            assert!(
+                !ctx.running.load(Ordering::SeqCst),
+                "listener must stop after {event_type:?} without trust"
+            );
+        }
+    }
+
+    /// While trust is still granted the listener keeps running (the normal
+    /// timeout recovery path).
+    #[test]
+    fn tap_disabled_with_trust_keeps_listener_running() {
+        let ctx = make_ctx_with(None, trusted);
+        deliver_tap_disabled(&ctx, CGEventType::TapDisabledByTimeout);
+        assert!(ctx.running.load(Ordering::SeqCst));
+    }
+
+    /// With a real tap: revoked trust leaves the tap disabled.
+    #[test]
+    fn tap_not_reenabled_without_trust() {
+        let Some(tap) = create_test_tap() else { return };
+
+        let ctx = make_ctx_with(Some(&tap), untrusted);
+        CGEvent::tap_enable(&tap, false);
+        assert!(!CGEvent::tap_is_enabled(&tap));
+
+        deliver_tap_disabled(&ctx, CGEventType::TapDisabledByTimeout);
+
+        assert!(
+            !CGEvent::tap_is_enabled(&tap),
+            "callback must not re-enable the tap once trust is revoked"
+        );
+        assert!(!ctx.running.load(Ordering::SeqCst));
     }
 
     /// Re-enabling must not depend on the state mutex being healthy: a
