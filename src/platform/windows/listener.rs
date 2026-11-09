@@ -95,6 +95,13 @@ struct HookContext {
     /// hold defuses the shell's menu heuristic for the whole hold; cleared
     /// once no Win/Alt modifier remains held.
     menu_mask_sent: bool,
+    /// Modifiers whose key-down this hook swallowed: the key that completes
+    /// a blocked modifier-only hotkey, such as the Alt of Ctrl+Alt. A
+    /// swallowed key-down never reaches the async key state, so
+    /// GetAsyncKeyState reports the key up while the user still holds it,
+    /// and reconciliation must not take that for a missed release
+    /// (cjpais/Handy#2398). Cleared on the modifier's own key-up.
+    swallowed_modifiers: Modifiers,
 }
 
 thread_local! {
@@ -206,6 +213,34 @@ fn adoptable_modifiers(
     adopt
 }
 
+/// The held-modifier set reconciliation should compare against: what
+/// GetAsyncKeyState reports, plus the modifiers whose key-down we swallowed
+/// ourselves. Without the second part, holding a blocked modifier-only
+/// hotkey (Ctrl+Alt) and clicking a mouse button reads the swallowed Alt as
+/// released and emits a synthetic Alt-up, which releases the hotkey while
+/// it is still held (cjpais/Handy#2398).
+fn effective_physical(physical: Modifiers, swallowed: Modifiers) -> Modifiers {
+    physical | swallowed
+}
+
+/// Swallowed-modifier bookkeeping for one modifier key event: a key-down the
+/// hook is about to swallow is recorded, and the modifier's key-up always
+/// clears it (whether or not that key-up is itself swallowed).
+fn update_swallowed(
+    swallowed: Modifiers,
+    modifier: Modifiers,
+    is_key_down: bool,
+    blocked: bool,
+) -> Modifiers {
+    if !is_key_down {
+        swallowed & !modifier
+    } else if blocked {
+        swallowed | modifier
+    } else {
+        swallowed
+    }
+}
+
 /// Reconcile tracked modifiers against the physical keyboard state.
 ///
 /// Corrects drift from missed events: secure desktop transitions swallow
@@ -225,12 +260,16 @@ fn adoptable_modifiers(
 /// unavoidable with this API — macOS avoids it because CGEvent flags are
 /// stamped per event.
 fn reconcile_modifiers(ctx: &mut HookContext) {
-    let physical = physical_modifiers();
+    let async_state = physical_modifiers();
+    // Once the OS reports a swallowed modifier down on its own (its
+    // auto-repeat key-downs pass through the hook), it needs no cover.
+    ctx.swallowed_modifiers &= !async_state;
+    let physical = effective_physical(async_state, ctx.swallowed_modifiers);
     // Phantom Ctrl only exists while AltGr is held; if LCtrl reads as up,
     // the phantom is gone (covers a phantom key-up swallowed by a secure
     // desktop transition, which would otherwise suppress CTRL_LEFT adoption
     // forever).
-    if ctx.altgr_phantom_ctrl && !physical.contains(Modifiers::CTRL_LEFT) {
+    if ctx.altgr_phantom_ctrl && !async_state.contains(Modifiers::CTRL_LEFT) {
         ctx.altgr_phantom_ctrl = false;
     }
     for event in release_events(
@@ -256,6 +295,10 @@ fn reconcile_modifiers(ctx: &mut HookContext) {
 fn reconcile_modifiers_in_context() {
     HOOK_CONTEXT.with(|ctx_cell| {
         if let Some(ctx) = ctx_cell.borrow_mut().as_mut() {
+            // A swallowed modifier's key-up may have happened on the secure
+            // desktop or before a suspend, out of the hook's sight; trust
+            // the OS alone here so it cannot stick.
+            ctx.swallowed_modifiers = Modifiers::empty();
             reconcile_modifiers(ctx);
         }
     });
@@ -406,6 +449,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
                 blocking_hotkeys: thread_blocking,
                 altgr_phantom_ctrl: false,
                 menu_mask_sent: false,
+                swallowed_modifiers: Modifiers::empty(),
             });
         });
 
@@ -584,6 +628,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         changed_modifier: Some(modifier),
                     });
                 }
+
+                ctx.swallowed_modifiers =
+                    update_swallowed(ctx.swallowed_modifiers, modifier, is_key_down, should_block);
 
                 // The hold ends once no Win/Alt modifier remains held; the
                 // next hold gets a fresh mask.
@@ -1070,6 +1117,7 @@ mod tests {
             blocking_hotkeys: None,
             altgr_phantom_ctrl: false,
             menu_mask_sent: true,
+            swallowed_modifiers: Modifiers::empty(),
         };
         reconcile_modifiers(&mut ctx);
         assert_eq!(ctx.current_modifiers, Modifiers::empty());
@@ -1077,6 +1125,92 @@ mod tests {
         // The stale CMD_LEFT was cleared via a synthetic release event.
         let release = rx.try_recv().expect("expected a synthetic release");
         assert_eq!(release.changed_modifier, Some(Modifiers::CMD_LEFT));
+        assert!(!release.is_key_down);
+    }
+
+    fn test_context(
+        current: Modifiers,
+        swallowed: Modifiers,
+    ) -> (HookContext, mpsc::Receiver<KeyEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = HookContext {
+            event_sender: tx,
+            current_modifiers: current,
+            blocking_hotkeys: None,
+            altgr_phantom_ctrl: false,
+            menu_mask_sent: false,
+            swallowed_modifiers: swallowed,
+        };
+        (ctx, rx)
+    }
+
+    #[test]
+    fn swallowed_modifier_is_not_stale() {
+        // cjpais/Handy#2398: Ctrl+Alt is a blocked modifier-only hotkey.
+        // Ctrl's key-down passed (async state has it); Alt's key-down was
+        // swallowed (async state does not). Alt must not read as released.
+        let tracked = Modifiers::CTRL_LEFT | Modifiers::OPT_LEFT;
+        let physical = effective_physical(Modifiers::CTRL_LEFT, Modifiers::OPT_LEFT);
+        assert_eq!(stale_modifiers(tracked, physical), Modifiers::empty());
+    }
+
+    #[test]
+    fn released_modifier_still_stale_beside_a_swallowed_one() {
+        // Covering the swallowed Alt must not hide a Ctrl whose key-up the
+        // hook missed.
+        let tracked = Modifiers::CTRL_LEFT | Modifiers::OPT_LEFT;
+        let physical = effective_physical(Modifiers::empty(), Modifiers::OPT_LEFT);
+        assert_eq!(stale_modifiers(tracked, physical), Modifiers::CTRL_LEFT);
+    }
+
+    #[test]
+    fn swallowed_set_on_blocked_key_down_only() {
+        let s = update_swallowed(Modifiers::empty(), Modifiers::OPT_LEFT, true, true);
+        assert_eq!(s, Modifiers::OPT_LEFT);
+        // A key-down that passes through is in the async state already.
+        let s = update_swallowed(Modifiers::empty(), Modifiers::OPT_LEFT, true, false);
+        assert_eq!(s, Modifiers::empty());
+    }
+
+    #[test]
+    fn swallowed_cleared_on_key_up_blocked_or_not() {
+        let held = Modifiers::CTRL_LEFT | Modifiers::OPT_LEFT;
+        assert_eq!(
+            update_swallowed(held, Modifiers::OPT_LEFT, false, false),
+            Modifiers::CTRL_LEFT
+        );
+        assert_eq!(
+            update_swallowed(held, Modifiers::OPT_LEFT, false, true),
+            Modifiers::CTRL_LEFT
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_swallowed_modifier_held() {
+        // The mouse-click path of cjpais/Handy#2398, through the real
+        // reconcile. No keys are physically held while tests run, so
+        // GetAsyncKeyState reports OPT_LEFT up, exactly as it does for a
+        // swallowed key-down.
+        let (mut ctx, rx) = test_context(Modifiers::OPT_LEFT, Modifiers::OPT_LEFT);
+        reconcile_modifiers(&mut ctx);
+        assert_eq!(ctx.current_modifiers, Modifiers::OPT_LEFT);
+        assert_eq!(ctx.swallowed_modifiers, Modifiers::OPT_LEFT);
+        assert!(rx.try_recv().is_err(), "no synthetic release expected");
+    }
+
+    #[test]
+    fn session_reconcile_clears_swallowed_modifiers() {
+        // Lock/unlock/resume: a swallowed modifier's key-up may have been
+        // lost to the secure desktop, so the session path trusts the OS
+        // alone and releases it.
+        let (ctx, rx) = test_context(Modifiers::OPT_LEFT, Modifiers::OPT_LEFT);
+        HOOK_CONTEXT.with(|cell| *cell.borrow_mut() = Some(ctx));
+        reconcile_modifiers_in_context();
+        let ctx = HOOK_CONTEXT.with(|cell| cell.borrow_mut().take()).unwrap();
+        assert_eq!(ctx.swallowed_modifiers, Modifiers::empty());
+        assert_eq!(ctx.current_modifiers, Modifiers::empty());
+        let release = rx.try_recv().expect("expected a synthetic release");
+        assert_eq!(release.changed_modifier, Some(Modifiers::OPT_LEFT));
         assert!(!release.is_key_down);
     }
 
