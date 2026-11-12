@@ -1,6 +1,7 @@
 //! macOS keyboard listener using CGEventTap
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +17,7 @@ use objc2_core_graphics::{
 };
 
 use crate::error::{Error, Result};
-use crate::platform::state::{BlockingHotkeys, ListenerState};
+use crate::platform::state::{swallow_key_event, BlockingHotkeys, ListenerState};
 use crate::types::{Key, KeyEvent, Modifiers};
 
 use super::keycode::{flags_have_alpha_shift, flags_have_fn, keycode_to_key, keycode_to_modifier};
@@ -155,6 +156,9 @@ fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
 struct CallbackCtx {
     state: Arc<Mutex<ListenerState>>,
     tap: Cell<Option<NonNull<CFMachPort>>>,
+    /// Keys whose key-down was swallowed and whose key-up hasn't arrived;
+    /// see `swallow_key_event`. Same single-thread reasoning as `tap`.
+    swallowed_keys: RefCell<HashSet<Key>>,
     /// The listener's `running` flag. The callback clears it to shut the
     /// tap thread down when accessibility trust has been revoked.
     running: Arc<AtomicBool>,
@@ -213,6 +217,9 @@ unsafe extern "C-unwind" fn event_tap_callback(
         if let Some(tap) = ctx.tap.get() {
             CGEvent::tap_enable(tap.as_ref(), true);
         }
+        // Key-ups may have been missed while disabled; don't let a stale
+        // entry swallow the next ordinary press of that key.
+        ctx.swallowed_keys.borrow_mut().clear();
         // Reconcile modifiers: we may have missed events while disabled.
         if let Ok(mut state) = ctx.state.lock() {
             reconcile_modifiers(
@@ -260,8 +267,17 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     return event.as_ptr();
                 }
 
-                // Check if this should be blocked
-                should_block = state.should_block(modifiers, key);
+                // Swallow a press that completes a blocking hotkey, and every
+                // repeat of a key whose press was swallowed, whatever flags
+                // the repeat carries.
+                if let Some(k) = key {
+                    should_block = swallow_key_event(
+                        &mut ctx.swallowed_keys.borrow_mut(),
+                        k,
+                        true,
+                        state.should_block(modifiers, key),
+                    );
+                }
 
                 let _ = state.event_sender.send(KeyEvent {
                     modifiers,
@@ -283,8 +299,16 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     return event.as_ptr();
                 }
 
-                // Block key up if we blocked key down (to be consistent)
-                should_block = state.should_block(modifiers, key);
+                // Block the key up exactly when its key down was blocked, so
+                // the app never sees an unpaired event.
+                if let Some(k) = key {
+                    should_block = swallow_key_event(
+                        &mut ctx.swallowed_keys.borrow_mut(),
+                        k,
+                        false,
+                        state.should_block(modifiers, key),
+                    );
+                }
 
                 let _ = state.event_sender.send(KeyEvent {
                     modifiers,
@@ -487,6 +511,7 @@ fn run_event_tap(
     let ctx_ptr = Box::into_raw(Box::new(CallbackCtx {
         state: Arc::clone(&state),
         tap: Cell::new(None),
+        swallowed_keys: RefCell::new(HashSet::new()),
         running: Arc::clone(&running),
         is_trusted: check_accessibility,
     }));
@@ -704,6 +729,7 @@ mod tests {
         CallbackCtx {
             state: Arc::new(Mutex::new(ListenerState::new(tx, None))),
             tap: Cell::new(tap.map(|t| NonNull::from(&**t))),
+            swallowed_keys: RefCell::new(HashSet::new()),
             running: Arc::new(AtomicBool::new(true)),
             is_trusted,
         }
@@ -751,6 +777,73 @@ mod tests {
                 "callback must re-enable the tap after {event_type:?}"
             );
         }
+    }
+
+    /// Feed a synthetic key event with explicit flags through the callback
+    /// and report whether it was swallowed. Creating (not posting) events
+    /// needs no accessibility permission, so this runs everywhere.
+    fn deliver_key(ctx: &CallbackCtx, keycode: u16, key_down: bool, flags: CGEventFlags) -> bool {
+        let event =
+            CGEvent::new_keyboard_event(None, keycode, key_down).expect("create keyboard event");
+        CGEvent::set_flags(Some(&event), flags);
+        let event_type = if key_down {
+            CGEventType::KeyDown
+        } else {
+            CGEventType::KeyUp
+        };
+        let returned = unsafe {
+            event_tap_callback(
+                std::ptr::null_mut(),
+                event_type,
+                NonNull::from(&*event),
+                ctx as *const CallbackCtx as *mut c_void,
+            )
+        };
+        returned.is_null()
+    }
+
+    /// cjpais/Handy#2437: once the press of a blocking hotkey is swallowed,
+    /// its repeats and its release must be swallowed too, even when they
+    /// arrive without the hotkey's modifier flags.
+    #[test]
+    fn held_hotkey_key_is_swallowed_until_release() {
+        const KEYCODE_E: u16 = 0x0E;
+        let hyper = CGEventFlags::MaskControl
+            | CGEventFlags::MaskAlternate
+            | CGEventFlags::MaskShift
+            | CGEventFlags::MaskCommand;
+        let none = CGEventFlags(0);
+
+        let hotkey = crate::types::Hotkey::new(
+            Modifiers::CTRL_LEFT
+                | Modifiers::OPT_LEFT
+                | Modifiers::SHIFT_LEFT
+                | Modifiers::CMD_LEFT,
+            Key::E,
+        )
+        .unwrap();
+        let blocking: BlockingHotkeys = Arc::new(Mutex::new(HashSet::from([hotkey])));
+        let (tx, _rx) = mpsc::channel();
+        let ctx = CallbackCtx {
+            state: Arc::new(Mutex::new(ListenerState::new(tx, Some(blocking)))),
+            tap: Cell::new(None),
+            swallowed_keys: RefCell::new(HashSet::new()),
+            running: Arc::new(AtomicBool::new(true)),
+            is_trusted: trusted,
+        };
+
+        assert!(deliver_key(&ctx, KEYCODE_E, true, hyper), "hotkey press");
+        assert!(
+            deliver_key(&ctx, KEYCODE_E, true, none),
+            "repeat without flags"
+        );
+        assert!(
+            deliver_key(&ctx, KEYCODE_E, false, none),
+            "release without flags"
+        );
+        // Ordinary typing afterwards is untouched.
+        assert!(!deliver_key(&ctx, KEYCODE_E, true, none), "plain press");
+        assert!(!deliver_key(&ctx, KEYCODE_E, false, none), "plain release");
     }
 
     /// cjpais/Handy#1281: once accessibility trust is revoked, a tap-disabled
